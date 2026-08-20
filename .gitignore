@@ -2,12 +2,14 @@ old/x64/*
 old/.vs/*
 .idea/*
 aria2c.exe
-aria2c.conf
+aria2.conf
+aria2.session
 ui_config.json
 *.spec
 *.log
 /dist
 /build
+/.vscode
 /.opencode
 /.venv-build
 /test_out
