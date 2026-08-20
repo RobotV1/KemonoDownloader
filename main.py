@@ -6,13 +6,16 @@ import locale
 import os
 import platform
 import signal
+import sys
 import time
-from typing import Dict, Iterable, Optional, List
+from typing import Callable, Dict, Iterable, Optional, List
 from dataclasses import dataclass, field
 import logging
+import threading
 import unicodedata
 import re
 import subprocess
+from datetime import date, datetime
 from urllib.parse import urlencode, urlparse
 
 import requests
@@ -133,6 +136,15 @@ NUMBER_ATTACHMENTS_IMAGES = "images"
 NUMBER_ATTACHMENTS_RENAME_ALL = "rename"
 NUMBER_ATTACHMENTS_RENAME_IMAGES = "rename_images"
 
+EXISTING_FILE_SKIP = "skip"
+EXISTING_FILE_REDOWNLOAD = "redownload"
+EXISTING_FILE_VERIFY = "verify"
+EXISTING_FILE_MODES = (
+    EXISTING_FILE_SKIP,
+    EXISTING_FILE_REDOWNLOAD,
+    EXISTING_FILE_VERIFY,
+)
+
 IMAGE_ATTACHMENT_EXTENSIONS = {
     ".apng",
     ".avif",
@@ -192,6 +204,28 @@ class Config:
     emptyContentRetryMilestones: List[int] = field(default_factory=lambda: [1, 3, 7, 13])
     emptyContentRetryMilestonesDone: set = field(default_factory=set)
     numberAttachmentsMode: str = NUMBER_ATTACHMENTS_OFF
+    # ---- 过滤配置 ----
+    extBlacklist: List[str] = field(default_factory=list)
+    extWhitelist: List[str] = field(default_factory=list)
+    titleBlacklistMatcher: Optional[Callable[[str], bool]] = None
+    titleWhitelistMatcher: Optional[Callable[[str], bool]] = None
+    nameBlacklistMatcher: Optional[Callable[[str], bool]] = None
+    nameWhitelistMatcher: Optional[Callable[[str], bool]] = None
+    dateFrom: Optional[date] = None
+    dateTo: Optional[date] = None
+    # ---- 已存在文件处理: skip / redownload / verify ----
+    existingFileMode: str = EXISTING_FILE_VERIFY
+    activeReferer: Optional[str] = None
+    # ---- 流水线模式 ----
+    pipelineEnabled: bool = True
+    pendingTasks: List["DownloadTask"] = field(default_factory=list)
+    failedAttachments: List[str] = field(default_factory=list)
+    # ---- 运行控制（暂停/停止，由 UI 驱动；CLI 下恒为运行态）----
+    pause_event: threading.Event = field(default_factory=threading.Event)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+
+    def __post_init__(self):
+        self.pause_event.set()
 
 
 SMALL_RETRY_TIMES = 2
@@ -205,6 +239,218 @@ MAX_TOTAL_RETRY = BIG_RETRY_TIMES * (SMALL_RETRY_TIMES + 1)
 _local_aria2_process: Optional[subprocess.Popen] = None
 _local_aria2_rpc_url: Optional[str] = None
 _local_aria2_cleanup_started = False
+
+# 当前运行中的 Config（供 UI 获取暂停/停止控制句柄）
+_active_config: Optional[Config] = None
+
+
+def get_active_config() -> Optional[Config]:
+    return _active_config
+
+
+def check_run_control(config: Config) -> bool:
+    """
+    运行控制检查点：
+      暂停时挂起调用线程（暂停期间 worker 线程被阻塞，UI 不受影响）；
+      停止请求后返回 False。
+    """
+    config.pause_event.wait()
+    return not config.stop_event.is_set()
+
+
+def abort_pending_tasks(config: Config) -> None:
+    """
+    停止时清理所有在途 aria2 任务（尽力而为），
+    避免未完成任务残留在 aria2.session 中导致下次启动时失控自动续下。
+    """
+    for task in list(config.pendingTasks):
+        gid = task.gid
+        if not gid:
+            continue
+        try:
+            aria2_rpc_call(
+                "aria2.remove", [gid],
+                aria2_rpc_url=config.aria2_rpc_url, aria2_token=None, timeout=5,
+            )
+        except Exception:
+            pass
+        try:
+            aria2_rpc_call(
+                "aria2.removeDownloadResult", [gid],
+                aria2_rpc_url=config.aria2_rpc_url, aria2_token=None, timeout=5,
+            )
+        except Exception:
+            pass
+    config.pendingTasks.clear()
+    logger.info(i18n(
+        "已清理在途 aria2 下载任务。",
+        "Cleaned up in-flight aria2 download tasks.",
+    ))
+
+ARIA2_CONF_PATH = "aria2.conf"
+
+# aria2.conf 缺失时自动生成的默认配置
+DEFAULT_ARIA2_CONF = """## 文件保存相关 ##
+
+# 启用磁盘缓存, 0为禁用缓存, 需1.16以上版本, 默认:16M
+disk-cache=64M
+
+# 文件预分配方式, 可选：none, prealloc, trunc, falloc, 默认:prealloc
+# 预分配对于机械硬盘可有效降低磁盘碎片、提升磁盘读写性能、延长磁盘寿命。
+# 机械硬盘使用 ext4（具有扩展支持），btrfs，xfs 或 NTFS（仅 MinGW 编译版本）等文件系统建议设置为 falloc
+# 若无法下载，提示 fallocate failed.cause：Operation not supported 则说明不支持，请设置为 none
+# prealloc 分配速度慢, trunc 无实际作用，不推荐使用。
+# 固态硬盘不需要预分配，只建议设置为 none ，否则可能会导致双倍文件大小的数据写入，从而影响寿命。
+file-allocation=none
+
+# 断点续传
+continue=true
+
+# 始终尝试断点续传，无法断点续传则终止下载，默认：true
+always-resume=false
+
+# 不支持断点续传的 URI 数值，当 always-resume=false 时生效。
+# 达到这个数值从将头开始下载，值为 0 时所有 URI 不支持断点续传时才从头开始下载。
+max-resume-failure-tries=0
+
+## 下载连接相关 ##
+
+# 文件未找到重试次数，默认:0 (禁用)
+# 重试时同时会记录重试次数，所以也需要设置 max-tries 这个选项
+max-file-not-found=10
+
+# 最大尝试次数，0 表示无限，默认:5
+max-tries=0
+
+# 重试等待时间（秒）, 默认:0 (禁用)
+retry-wait=10
+
+# 连接超时时间（秒）。默认：60
+connect-timeout=60
+
+# 最大同时下载任务数, 运行时可修改, 默认:5
+max-concurrent-downloads=5
+
+# 同一服务器连接数, 添加时可指定, 最大:16
+max-connection-per-server=16
+
+# 最小文件分片大小, 添加时可指定, 取值范围1M -1024M, 默认:20M
+# 假定size=10M, 文件为20MiB 则使用两个来源下载; 文件为15MiB 则使用一个来源下载
+#min-split-size=10M
+
+# 单个任务最大线程数, 添加时可指定, 默认:5
+split=5
+
+# 整体下载速度限制, 运行时可修改, 默认:0
+#max-overall-download-limit=
+
+# 单个任务下载速度限制, 默认:0
+#max-download-limit=
+
+# 整体上传速度限制, 运行时可修改, 默认:0
+#max-overall-upload-limit=0
+
+# 单个任务上传速度限制, 默认:0
+#max-upload-limit=0
+
+# GZip 支持，默认:false
+http-accept-gzip=true
+
+# URI 复用，默认: true
+reuse-uri=false
+
+# 禁用 netrc 支持，默认:false
+no-netrc=true
+
+# 允许覆盖，当相关控制文件(.aria2)不存在时从头开始重新下载。默认:false
+allow-overwrite=true
+
+# 使用 UTF-8 处理 Content-Disposition ，默认:false
+content-disposition-default-utf8=true
+
+# 禁用IPv6, 默认:false
+#disable-ipv6=false
+
+# 代理服务器
+#all-proxy=http://127.0.0.1:7897
+
+async-dns=false
+
+## 进度保存相关 ##
+
+# 从会话文件中读取下载任务
+input-file=aria2.session
+# 在Aria2退出时保存`错误/未完成`的下载任务到会话文件
+save-session=aria2.session
+# 定时保存会话, 0为退出时才保存（此处需要设置，否则失去自动保存）, 需1.16.1以上版本, 默认:0 
+
+# 任务状态改变后保存会话的间隔时间（秒）, 0 为仅在进程正常退出时保存, 默认:0
+# 为了及时保存任务状态、防止任务丢失，此项值只建议设置为 1
+save-session-interval=1
+
+# 自动保存任务进度到控制文件(*.aria2)的间隔时间（秒），0 为仅在进程正常退出时保存，默认：60
+# 此项值也会间接影响从内存中把缓存的数据写入磁盘的频率
+# 想降低磁盘 IOPS (每秒读写次数)则提高间隔时间
+# 想在意外非正常退出时尽量保存更多的下载进度则降低间隔时间
+# 非正常退出：进程崩溃、系统崩溃、SIGKILL 信号、设备断电等
+auto-save-interval=20
+
+# 强制保存，即使任务已完成也保存信息到会话文件, 默认:false
+# 开启后会在任务完成后保留 .aria2 文件，文件被移除且任务存在的情况下重启后会重新下载。
+# 关闭后已完成的任务列表会在重启后清空。
+force-save=false
+
+## RPC相关设置 ##
+
+# 启用RPC, 默认:false
+enable-rpc=true
+# 允许所有来源, 默认:false
+rpc-allow-origin-all=true
+# 允许非外部访问, 默认:false
+rpc-listen-all=true
+# 事件轮询方式, 取值:[epoll, kqueue, port, poll, select], 不同系统默认值不同
+#event-poll=select
+# RPC监听端口, 端口被占用时可以修改, 默认:6800
+rpc-listen-port=6888
+
+user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0
+
+# 安静模式
+# 禁止在控制台输出日志
+quiet=true
+"""
+
+
+def ensure_aria2_conf(conf_path: str = ARIA2_CONF_PATH) -> None:
+    """aria2.conf / aria2.session 缺失时按默认配置自动生成。"""
+    if not os.path.exists(conf_path):
+        try:
+            with open(conf_path, "w", encoding="utf-8") as f:
+                f.write(DEFAULT_ARIA2_CONF)
+            logger.info(i18n(
+                f"未找到 {conf_path}，已按默认配置生成。",
+                f"{conf_path} not found; generated with default settings.",
+            ))
+        except OSError as e:
+            logger.warning(i18n(
+                f"生成默认 {conf_path} 失败: {e}",
+                f"Failed to generate default {conf_path}: {e}",
+            ))
+
+    session_path = os.path.join(os.path.dirname(os.path.abspath(conf_path)) or ".", "aria2.session")
+    if not os.path.exists(session_path):
+        try:
+            with open(session_path, "w", encoding="utf-8"):
+                pass
+            logger.info(i18n(
+                "未找到 aria2.session，已自动生成空文件。",
+                "aria2.session not found; generated an empty file.",
+            ))
+        except OSError as e:
+            logger.warning(i18n(
+                f"生成默认 aria2.session 失败: {e}",
+                f"Failed to generate default aria2.session: {e}",
+            ))
 
 
 def build_ariang_rpc_setup_url(aria2_rpc_url: str) -> str:
@@ -543,6 +789,8 @@ class DownloadTask:
     sourceName: str
     targetFolder: str
     retry_count: int = 0
+    # 流水线模式：失败重试的到期时间戳；None 表示任务正在 aria2 中下载
+    retry_due: Optional[float] = None
 
 
 @dataclass
@@ -764,6 +1012,239 @@ def rename_existing_attachment_files(
     return missing_count == 0
 
 
+# ---------------------------
+# 过滤 & 已存在文件检查
+# ---------------------------
+def parse_date_arg(value: str) -> date:
+    """argparse type: YYYY-MM-DD -> date。"""
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            i18n(
+                f"无效的日期: {value!r}，格式应为 YYYY-MM-DD",
+                f"Invalid date: {value!r}; expected format YYYY-MM-DD",
+            )
+        )
+
+
+def parse_list_arg(value: str) -> List[str]:
+    """argparse type: 逗号分隔的字符串 -> 列表（去空白、去空项）。"""
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def parse_ext_list_arg(value: str) -> List[str]:
+    """argparse type: 逗号分隔的扩展名列表，统一为小写且不带点。"""
+    return [item.lower().lstrip(".") for item in parse_list_arg(value)]
+
+
+def compile_text_matcher(
+        patterns: List[str],
+        use_regex: bool,
+) -> Optional[Callable[[str], bool]]:
+    """
+    根据模式列表构建匹配器；列表为空返回 None（表示不过滤）。
+    use_regex 时按正则 search 匹配（不区分大小写），否则按不区分大小写的子串匹配。
+    正则非法时抛出 re.error，由调用方处理。
+    """
+    if not patterns:
+        return None
+    if use_regex:
+        compiled = [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+
+        def regex_match(text: str) -> bool:
+            return any(pattern.search(text) for pattern in compiled)
+
+        return regex_match
+
+    lowered = [pattern.lower() for pattern in patterns]
+
+    def substring_match(text: str) -> bool:
+        lowered_text = text.lower()
+        return any(pattern in lowered_text for pattern in lowered)
+
+    return substring_match
+
+
+def _passes_black_white_lists(
+        text: str,
+        whitelist_matcher: Optional[Callable[[str], bool]],
+        blacklist_matcher: Optional[Callable[[str], bool]],
+) -> bool:
+    """白名单非空则须命中白名单，且不得命中黑名单。"""
+    if whitelist_matcher is not None and not whitelist_matcher(text):
+        return False
+    if blacklist_matcher is not None and blacklist_matcher(text):
+        return False
+    return True
+
+
+def match_post_title(title: str, config: Config) -> bool:
+    return _passes_black_white_lists(
+        title,
+        config.titleWhitelistMatcher,
+        config.titleBlacklistMatcher,
+    )
+
+
+def match_attachment(attachment: dict, config: Config) -> bool:
+    """
+    扩展名 / 文件名过滤。embed 附件（.url 快捷方式）不受过滤影响。
+    """
+    att_type = str(attachment.get("type") or "").strip().lower()
+    if att_type == "embed":
+        return True
+
+    ext = get_attachment_extension(attachment).lstrip(".")
+    if config.extWhitelist and ext not in config.extWhitelist:
+        return False
+    if ext and ext in config.extBlacklist:
+        return False
+
+    return _passes_black_white_lists(
+        get_attachment_source_name(attachment),
+        config.nameWhitelistMatcher,
+        config.nameBlacklistMatcher,
+    )
+
+
+def _partition_filtered(
+        attachments: List[dict],
+        config: Config,
+) -> tuple[List[dict], List[dict]]:
+    """按过滤规则拆分附件列表，返回 (保留, 被过滤)。"""
+    kept, filtered = [], []
+    for attachment in attachments:
+        (kept if match_attachment(attachment, config) else filtered).append(attachment)
+    return kept, filtered
+
+
+def get_post_date(post: dict) -> Optional[date]:
+    """从帖子 published 字段解析日期（取前 10 位 YYYY-MM-DD）；失败返回 None。"""
+    published = post.get("published")
+    if not published:
+        return None
+    try:
+        return datetime.strptime(str(published)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def probe_remote_file_size(
+        server: str,
+        path: str,
+        url_name: str,
+        config: Config,
+) -> Optional[int]:
+    """
+    通过 HEAD 请求探测远程文件大小（字节）。
+    任何失败（网络错误、非 2xx、缺少 Content-Length）均返回 None（fail-open）。
+    """
+    url = server.rstrip("/") + "/data" + path + "?" + urlencode({"f": url_name})
+    headers = build_request_headers(config, referer=config.activeReferer)
+    try:
+        response = config.session.head(
+            url,
+            proxies=config.proxies,
+            headers=headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            logger.warning(i18n(
+                f"探测远程文件大小失败 (HTTP {response.status_code}): {url}",
+                f"Failed to probe remote file size (HTTP {response.status_code}): {url}",
+            ))
+            return None
+        content_length = response.headers.get("Content-Length")
+        if content_length is None:
+            logger.warning(i18n(
+                f"远程响应缺少 Content-Length，无法校验大小: {url}",
+                f"Remote response has no Content-Length; cannot verify size: {url}",
+            ))
+            return None
+        return int(content_length)
+    except (ValueError, requests.exceptions.RequestException) as e:
+        logger.warning(i18n(
+            f"探测远程文件大小时发生错误: {e} ({url})",
+            f"Error while probing remote file size: {e} ({url})",
+        ))
+        return None
+
+
+def check_local_file(
+        targetFolder: str,
+        download_name: str,
+        server: str,
+        path: str,
+        url_name: str,
+        config: Config,
+) -> str:
+    """
+    检查本地已存在文件，返回 "download"（需要下载）或 "skip"（跳过）。
+
+    判定规则：
+      1. 文件不存在 -> download；
+      2. 存在 .aria2 控制文件（下载中断残留）-> download（aria2 会断点续传）；
+      3. existingFileMode == redownload -> download（总是重下，兼容旧行为）；
+      4. existingFileMode == skip -> skip；
+      5. existingFileMode == verify -> HEAD 探测比对大小：
+         相等 -> skip；不等 -> 删除本地文件后 download；探测失败 -> 保守 skip。
+    """
+    file_path = os.path.join(
+        targetFolder,
+        sanitizeFilenameAdvanced(str(download_name), config.targetOS),
+    )
+
+    if not os.path.exists(file_path):
+        return "download"
+
+    if os.path.exists(file_path + ".aria2"):
+        logger.info(i18n(
+            f"检测到中断的下载残留 (.aria2)，将续传/重下: {file_path}",
+            f"Found interrupted download residue (.aria2); will resume/redownload: {file_path}",
+        ))
+        return "download"
+
+    if config.existingFileMode == EXISTING_FILE_REDOWNLOAD:
+        return "download"
+
+    if config.existingFileMode == EXISTING_FILE_SKIP:
+        logger.info(i18n(f"文件已存在，跳过: {file_path}", f"File exists, skipped: {file_path}"))
+        return "skip"
+
+    remote_size = probe_remote_file_size(server, path, url_name, config)
+    if remote_size is None:
+        logger.warning(i18n(
+            f"无法探测远程大小，保守跳过已存在文件: {file_path}",
+            f"Could not probe remote size; conservatively skipping existing file: {file_path}",
+        ))
+        return "skip"
+
+    local_size = os.path.getsize(file_path)
+    if local_size == remote_size:
+        logger.info(i18n(
+            f"文件已存在且大小一致 ({local_size} 字节)，跳过: {file_path}",
+            f"File exists with matching size ({local_size} bytes), skipped: {file_path}",
+        ))
+        return "skip"
+
+    logger.info(i18n(
+        f"文件大小不一致（本地 {local_size} / 远程 {remote_size} 字节），重新下载: {file_path}",
+        f"Size mismatch (local {local_size} / remote {remote_size} bytes); redownloading: {file_path}",
+    ))
+    try:
+        os.remove(file_path)
+    except OSError as e:
+        logger.warning(i18n(
+            f"删除损坏文件失败 {file_path}: {e}",
+            f"Failed to delete corrupted file {file_path}: {e}",
+        ))
+    return "download"
+
+
 def submit_all_attachments(
         attachment_plans: List[AttachmentNamePlan],
         targetFolder: str,
@@ -785,6 +1266,17 @@ def submit_all_attachments(
 
         path = attachment.get("path")
         server = get_attachment_server(attachment, config)
+
+        decision = check_local_file(
+            targetFolder,
+            attachmentName,
+            server,
+            path,
+            plan.source_name,
+            config,
+        )
+        if decision == "skip":
+            continue
 
         try:
             gid = downloadRes(
@@ -845,6 +1337,30 @@ def poll_and_retry_tasks(
     ))
 
     while active_tasks:
+        if not check_run_control(config):
+            for task in active_tasks:
+                gid = task.gid
+                try:
+                    aria2_rpc_call(
+                        "aria2.remove", [gid],
+                        aria2_rpc_url=config.aria2_rpc_url,
+                        aria2_token=None, timeout=5,
+                    )
+                except Exception:
+                    pass
+                try:
+                    aria2_rpc_call(
+                        "aria2.removeDownloadResult", [gid],
+                        aria2_rpc_url=config.aria2_rpc_url,
+                        aria2_token=None, timeout=5,
+                    )
+                except Exception:
+                    pass
+            logger.info(i18n(
+                "收到停止请求，已清理在途 aria2 下载任务。",
+                "Stop requested; cleaned up in-flight aria2 download tasks.",
+            ))
+            return False
         for task in list(active_tasks):
             gid = task.gid
             attachment = task.attachment
@@ -980,6 +1496,176 @@ def poll_and_retry_tasks(
     return all_success
 
 
+def sweep_pending_tasks(config: Config) -> None:
+    """
+    流水线模式：对所有在途任务做一次非阻塞状态扫描。
+      - 下载完成 -> 移出队列；
+      - 下载失败 -> 计算退避时间并记录 retry_due，到期后重新提交（不阻塞抓取流程）；
+      - 重试到期 -> 清理残留文件并重新提交。
+    """
+    if not config.pendingTasks:
+        return
+
+    now = time.time()
+    for task in list(config.pendingTasks):
+        attachmentName = task.attachmentName
+
+        # 等待重试到期的任务
+        if task.retry_due is not None:
+            if task.retry_due > now:
+                continue
+            config.pendingTasks.remove(task)
+            cleanup_files(task.targetFolder, attachmentName)
+            try:
+                new_gid = downloadRes(
+                    task.attachment.get("path"),
+                    get_attachment_server(task.attachment, config),
+                    attachmentName,
+                    task.targetFolder,
+                    aria2_rpc_url=config.aria2_rpc_url,
+                    aria2_token=None,
+                    sourceAttachmentName=task.sourceName,
+                    targetOS=config.targetOS,
+                )
+                logger.info(i18n(
+                    f"已重新提交附件 {attachmentName}，新 GID={new_gid} "
+                    f"(重试次数: {task.retry_count})",
+                    f"Resubmitted attachment {attachmentName}; new GID={new_gid} "
+                    f"(retry count: {task.retry_count})",
+                ))
+                task.gid = new_gid
+                task.retry_due = None
+                config.pendingTasks.append(task)
+            except Exception as e:
+                logger.error(i18n(
+                    f"重试提交附件 {attachmentName} 到 Aria2 失败: {e}",
+                    f"Failed to resubmit attachment {attachmentName} to Aria2: {e}",
+                ))
+                if task.retry_count >= MAX_TOTAL_RETRY:
+                    config.failedAttachments.append(attachmentName)
+                else:
+                    task.retry_due = time.time() + BIG_RETRY_BASE_INTERVAL
+                    config.pendingTasks.append(task)
+            continue
+
+        gid = task.gid
+        try:
+            res = aria2_rpc_call(
+                "aria2.tellStatus",
+                [gid],
+                aria2_rpc_url=config.aria2_rpc_url,
+                aria2_token=None,
+            )
+            status = res.get("result", {}).get("status")
+        except Exception as e:
+            logger.error(i18n(
+                f"查询 GID={gid} (附件 {attachmentName}) 状态失败: {e}",
+                f"Failed to query status for GID={gid} (attachment {attachmentName}): {e}",
+            ))
+            continue
+
+        if status == "complete":
+            logger.info(i18n(
+                f"附件 {attachmentName} 下载完成 (GID={gid})",
+                f"Attachment {attachmentName} download completed (GID={gid})",
+            ))
+            config.pendingTasks.remove(task)
+
+        elif status in ("error", "removed"):
+            logger.warning(i18n(
+                f"附件 {attachmentName} 下载失败 (GID={gid})，当前重试次数: {task.retry_count}",
+                f"Attachment {attachmentName} download failed (GID={gid}); current retry count: {task.retry_count}",
+            ))
+            config.pendingTasks.remove(task)
+            try:
+                aria2_rpc_call(
+                    "aria2.removeDownloadResult",
+                    [gid],
+                    aria2_rpc_url=config.aria2_rpc_url,
+                    aria2_token=None,
+                )
+            except Exception as e:
+                logger.warning(i18n(
+                    f"从 aria2 删除任务记录失败 (GID={gid}): {e}",
+                    f"Failed to remove download record from aria2 (GID={gid}): {e}",
+                ))
+            if task.retry_count >= MAX_TOTAL_RETRY:
+                logger.error(i18n(
+                    f"附件 {attachmentName} 已耗尽最大重试次数 ({MAX_TOTAL_RETRY})，放弃下载。",
+                    f"Attachment {attachmentName} reached the maximum retry count ({MAX_TOTAL_RETRY}); giving up.",
+                ))
+                config.failedAttachments.append(attachmentName)
+                continue
+            if task.retry_count < SMALL_RETRY_TIMES:
+                backoff = SMALL_RETRY_INTERVAL
+            else:
+                backoff = BIG_RETRY_BASE_INTERVAL * (task.retry_count - SMALL_RETRY_TIMES + 1)
+            task.retry_count += 1
+            task.retry_due = now + backoff
+            logger.info(i18n(
+                f"附件 {attachmentName} 将在 {backoff} 秒后重试 "
+                f"(重试次数: {task.retry_count}/{MAX_TOTAL_RETRY})",
+                f"Attachment {attachmentName} will retry in {backoff} seconds "
+                f"(retry {task.retry_count}/{MAX_TOTAL_RETRY})",
+            ))
+            config.pendingTasks.append(task)
+
+        else:
+            logger.debug(i18n(
+                f"附件 {attachmentName} 状态: {status} (GID={gid})，继续等待...",
+                f"Attachment {attachmentName} status: {status} (GID={gid}); waiting...",
+            ))
+
+
+def drain_pending_tasks(config: Config, poll_interval: int = 3) -> bool:
+    """
+    流水线模式收尾：阻塞扫描直到所有在途任务结束（成功或耗尽重试）。
+    返回是否全部成功。
+    """
+    if not config.pipelineEnabled:
+        return not config.failedAttachments
+
+    if config.pendingTasks:
+        logger.info(i18n(
+            f"抓取结束，等待剩余 {len(config.pendingTasks)} 个下载任务完成...",
+            f"Fetching finished; waiting for {len(config.pendingTasks)} remaining download task(s)...",
+        ))
+    while config.pendingTasks:
+        if not check_run_control(config):
+            abort_pending_tasks(config)
+            return False
+        sweep_pending_tasks(config)
+        if config.pendingTasks:
+            time.sleep(poll_interval)
+
+    if config.failedAttachments:
+        logger.error(i18n(
+            f"共 {len(config.failedAttachments)} 个附件下载失败: {config.failedAttachments}",
+            f"{len(config.failedAttachments)} attachment(s) failed: {config.failedAttachments}",
+        ))
+    else:
+        logger.info(i18n(
+            "全部附件的下载任务已处理完毕。",
+            "All attachment download tasks have been processed.",
+        ))
+    return not config.failedAttachments
+
+
+def sleep_with_sweeps(config: Config, seconds: float) -> None:
+    """流水线模式下把帖间等待拆分为小片，其间扫描下载状态。"""
+    if not config.pipelineEnabled or seconds <= 0:
+        if not check_run_control(config):
+            return
+        time.sleep(max(0.0, seconds))
+        return
+    slices = max(1, int(seconds))
+    for i in range(slices):
+        if not check_run_control(config):
+            return
+        time.sleep(seconds / slices)
+        sweep_pending_tasks(config)
+
+
 def process_attachments_batch(
         attachment_plans: List[AttachmentNamePlan],
         postFolder: str,
@@ -988,9 +1674,14 @@ def process_attachments_batch(
     """
     对一个帖子里的所有附件：
       1. 先统一提交任务并记录 GID；
-      2. 再统一轮询所有 GID 的状态并按需重试。
+      2. 流水线模式：任务并入全局队列并做一次非阻塞扫描，立即返回；
+         非流水线模式：统一轮询所有 GID 的状态并按需重试（阻塞至完成）。
     """
     tasks, all_submitted = submit_all_attachments(attachment_plans, postFolder, config)
+    if config.pipelineEnabled:
+        config.pendingTasks.extend(tasks)
+        sweep_pending_tasks(config)
+        return all_submitted
     downloads_succeeded = poll_and_retry_tasks(tasks, config)
     return all_submitted and downloads_succeeded
 
@@ -1022,6 +1713,19 @@ def process_attachment(
         for i in config.skipPic:
             if i == attachment.get("path"):
                 return i18n(f"跳过垃圾附件 (path: {i})", f"Skipped junk attachment (path: {i})")
+        decision = check_local_file(
+            postFolder,
+            attachmentName,
+            get_attachment_server(attachment, config),
+            attachment.get("path"),
+            sourceName,
+            config,
+        )
+        if decision == "skip":
+            return i18n(
+                f"图片附件已存在，跳过: {attachmentName}",
+                f"Image attachment already exists, skipped: {attachmentName}",
+            )
         try:
             downloadRes(
                 attachment.get("path"),
@@ -1278,6 +1982,8 @@ def extract_post_from_detail(data, config: Config, postID: str):
 def retry_empty_content_posts(config: Config, reason: str):
     if not config.emptyContentPosts:
         return
+    if not check_run_control(config):
+        return
 
     logger.info(i18n(
         f"开始补抓空 content 帖子（{reason}），待处理: {len(config.emptyContentPosts)}",
@@ -1382,8 +2088,20 @@ def getPost(postID: str, userID: str, service: str, config: Config):
     path, postFolder = build_post_folder_path(post, config)
     logger.info(i18n(f"\n\n正在取帖子 {path}", f"\n\nFetching post {path}"))
 
+    config.activeReferer = build_kemono_referer(config, service, userID, postID)
+
     previews = data.get("previews", [])
     attachments = data.get("attachments", [])
+    previews, filtered_previews = _partition_filtered(previews, config)
+    attachments, filtered_attachments = _partition_filtered(attachments, config)
+    filtered_count = len(filtered_previews) + len(filtered_attachments)
+    if filtered_count:
+        logger.info(i18n(
+            f"根据过滤规则跳过 {filtered_count} 个附件: "
+            f"{[get_attachment_source_name(a) for a in filtered_previews + filtered_attachments]}",
+            f"Skipped {filtered_count} attachment(s) by filter rules: "
+            f"{[get_attachment_source_name(a) for a in filtered_previews + filtered_attachments]}",
+        ))
     preview_plans, attachment_plans = prepare_attachment_name_plans(
         previews,
         attachments,
@@ -1441,10 +2159,16 @@ def getPost(postID: str, userID: str, service: str, config: Config):
     if attachments:
         all_success = process_attachments_batch(attachment_plans, postFolder, config)
         if all_success:
-            logger.info(i18n(
-                "所有一般附件均下载成功，继续执行后续操作",
-                "All regular attachments downloaded successfully; continuing.",
-            ))
+            if config.pipelineEnabled:
+                logger.info(i18n(
+                    "所有一般附件均已提交下载（流水线模式，后台下载中）",
+                    "All regular attachments submitted (pipeline mode; downloading in background).",
+                ))
+            else:
+                logger.info(i18n(
+                    "所有一般附件均下载成功，继续执行后续操作",
+                    "All regular attachments downloaded successfully; continuing.",
+                ))
         else:
             logger.error(i18n(
                 "存在附件未能下载（文件未存储、提交失败或重试耗尽），"
@@ -1577,10 +2301,11 @@ def getPostFromPage(
     config.folder = os.path.join(config.folder, userName)
 
     count = o
+    selected_posts = 0
     processed_posts = 0
 
     while True:
-        if not config.postCounts == 0 and o + 1 > postBegins + config.postCounts - 1:
+        if config.postCounts > 0 and selected_posts >= config.postCounts:
             logger.info(i18n(
                 f"\n\n{config.postCounts}个帖子取完了…",
                 f"\n\nFinished fetching {config.postCounts} posts.",
@@ -1696,22 +2421,59 @@ def getPostFromPage(
             ))
             return None
 
+        stop_fetching = False
         for post in data:
-            if count < postBegins - 1:
-                count += 1
+            if not check_run_control(config):
+                logger.info(i18n(
+                    "\n\n收到停止请求，抓取已终止。",
+                    "\n\nStop requested; fetching aborted.",
+                ))
+                return None
+            count += 1  # count 现在表示当前帖子在列表中的序号（从 1 开始，新到旧）
+
+            # 范围条件 1: 起始序号
+            if count < postBegins:
                 continue
-            if config.postCounts == 0 or count < postBegins + config.postCounts - 1:
-                getPost(post.get("id"), post.get("user"), post.get("service"), config)
-                count += 1
-                processed_posts += 1
-                maybe_retry_empty_content_posts(config, processed_posts)
-                time.sleep(3)
-            else:
+
+            # 范围条件 2/3: 日期区间（均含当日）
+            post_date = get_post_date(post)
+            if post_date is not None:
+                if config.dateTo is not None and post_date > config.dateTo:
+                    continue  # 晚于截止日期，跳过但继续扫描
+                if config.dateFrom is not None and post_date < config.dateFrom:
+                    # 列表按新到旧排序，早于起始日期即可安全终止整个抓取
+                    logger.info(i18n(
+                        f"\n\n已到达起始日期 {config.dateFrom}，停止抓取。",
+                        f"\n\nReached start date {config.dateFrom}; stopping.",
+                    ))
+                    stop_fetching = True
+                    break
+
+            # 标题过滤（不消耗帖子详情请求）
+            title = str(post.get("title") or "")
+            if not match_post_title(title, config):
+                logger.info(i18n(
+                    f"根据标题过滤规则跳过帖子: {title} ({post.get('id')})",
+                    f"Skipped post by title filter: {title} ({post.get('id')})",
+                ))
+                continue
+
+            # 范围条件 4: 已选中数量上限
+            if config.postCounts > 0 and selected_posts >= config.postCounts:
                 logger.info(i18n(
                     f"\n\n{config.postCounts}个帖子取完了…",
                     f"\n\nFinished fetching {config.postCounts} posts.",
                 ))
                 return None
+
+            getPost(post.get("id"), post.get("user"), post.get("service"), config)
+            selected_posts += 1
+            processed_posts += 1
+            maybe_retry_empty_content_posts(config, processed_posts)
+            sleep_with_sweeps(config, 3)
+
+        if stop_fetching:
+            return None
 
 
 # ---------------------------
@@ -1874,7 +2636,7 @@ def parse_number_attachments_arg(value):
         ))
 
 
-def parse_args():
+def parse_args(argv=None):
     configure_argparse_language()
 
     default_baseUrl = "https://pawchive.pw/"
@@ -1967,6 +2729,154 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--ext_blacklist",
+        "--ext-blacklist",
+        dest="ext_blacklist",
+        type=parse_ext_list_arg,
+        default=[],
+        metavar="EXT1,EXT2,...",
+        help=i18n(
+            "扩展名黑名单（逗号分隔，不区分大小写），例如: mp4,zip",
+            "Extension blacklist (comma-separated, case-insensitive), for example: mp4,zip",
+        ),
+    )
+    parser.add_argument(
+        "--ext_whitelist",
+        "--ext-whitelist",
+        dest="ext_whitelist",
+        type=parse_ext_list_arg,
+        default=[],
+        metavar="EXT1,EXT2,...",
+        help=i18n(
+            "扩展名白名单（逗号分隔，不区分大小写）；非空时仅下载列出的类型",
+            "Extension whitelist (comma-separated, case-insensitive); if set, only listed types are downloaded",
+        ),
+    )
+    parser.add_argument(
+        "--name_blacklist",
+        "--name-blacklist",
+        dest="name_blacklist",
+        type=parse_list_arg,
+        default=[],
+        metavar="P1,P2,...",
+        help=i18n(
+            "文件名黑名单（逗号分隔）；默认按不区分大小写的子串匹配，--name_regex 启用后按正则匹配",
+            "Filename blacklist (comma-separated); case-insensitive substring match by default, regex when --name_regex is set",
+        ),
+    )
+    parser.add_argument(
+        "--name_whitelist",
+        "--name-whitelist",
+        dest="name_whitelist",
+        type=parse_list_arg,
+        default=[],
+        metavar="P1,P2,...",
+        help=i18n(
+            "文件名白名单（逗号分隔）；匹配规则同 --name_blacklist",
+            "Filename whitelist (comma-separated); same matching rules as --name_blacklist",
+        ),
+    )
+    parser.add_argument(
+        "--name_regex",
+        "--name-regex",
+        dest="name_regex",
+        type=parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=False,
+        help=i18n(
+            "文件名黑/白名单按正则表达式匹配（默认: false）",
+            "Treat filename blacklist/whitelist patterns as regular expressions (default: false)",
+        ),
+    )
+    parser.add_argument(
+        "--title_blacklist",
+        "--title-blacklist",
+        dest="title_blacklist",
+        type=parse_list_arg,
+        default=[],
+        metavar="P1,P2,...",
+        help=i18n(
+            "Post 标题黑名单（逗号分隔）；默认按不区分大小写的子串匹配，--title_regex 启用后按正则匹配",
+            "Post title blacklist (comma-separated); case-insensitive substring match by default, regex when --title_regex is set",
+        ),
+    )
+    parser.add_argument(
+        "--title_whitelist",
+        "--title-whitelist",
+        dest="title_whitelist",
+        type=parse_list_arg,
+        default=[],
+        metavar="P1,P2,...",
+        help=i18n(
+            "Post 标题白名单（逗号分隔）；匹配规则同 --title_blacklist",
+            "Post title whitelist (comma-separated); same matching rules as --title_blacklist",
+        ),
+    )
+    parser.add_argument(
+        "--title_regex",
+        "--title-regex",
+        dest="title_regex",
+        type=parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=False,
+        help=i18n(
+            "Post 标题黑/白名单按正则表达式匹配（默认: false）",
+            "Treat post title blacklist/whitelist patterns as regular expressions (default: false)",
+        ),
+    )
+    parser.add_argument(
+        "--date_from",
+        "--date-from",
+        dest="date_from",
+        type=parse_date_arg,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=i18n(
+            "起始日期（含当日），早于该日期的 post 不下载；与 --post_begins 同用表示从第 N 个取到该日期",
+            "Start date (inclusive); posts older than this are skipped. Combined with --post_begins, fetches from the Nth post back to this date",
+        ),
+    )
+    parser.add_argument(
+        "--date_to",
+        "--date-to",
+        dest="date_to",
+        type=parse_date_arg,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=i18n(
+            "截止日期（含当日），晚于该日期的 post 不下载；与 --post_counts 同用表示从该日期起取前 N 个",
+            "End date (inclusive); posts newer than this are skipped. Combined with --post_counts, fetches the first N posts starting from this date",
+        ),
+    )
+    parser.add_argument(
+        "--existing_file",
+        "--existing-file",
+        dest="existing_file",
+        choices=EXISTING_FILE_MODES,
+        default=EXISTING_FILE_VERIFY,
+        help=i18n(
+            "已存在文件的处理方式: skip=直接跳过; redownload=总是重新下载（旧行为）; "
+            "verify=探测远程文件大小，一致则跳过、不一致（损坏/中断）则重下（默认: verify）",
+            "How to handle existing files: skip=skip directly; redownload=always redownload (legacy behavior); "
+            "verify=probe remote file size, skip if identical, redownload if mismatched (default: verify)",
+        ),
+    )
+    parser.add_argument(
+        "--pipeline",
+        type=parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=True,
+        help=i18n(
+            "流水线模式：提交下载任务后不等待完成，继续抓取后续帖子，下载在后台并行进行"
+            "（默认: true；--pipeline false 恢复逐帖阻塞下载的旧行为）",
+            "Pipeline mode: continue fetching subsequent posts without waiting for downloads "
+            "(default: true; use --pipeline false to restore legacy blocking behavior)",
+        ),
+    )
+    parser.add_argument(
         "--kemono_mode",
         type=parse_bool_arg,
         nargs="?",
@@ -2008,7 +2918,7 @@ def parse_args():
         ),
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     return args
 
@@ -2027,6 +2937,8 @@ def init_file_logger(folder: str):
 
     if not existing_same_file_handler:
         try:
+            if folder and not os.path.isdir(folder):
+                os.makedirs(folder, exist_ok=True)
             file_handler = logging.FileHandler(file_log_path, encoding="utf-8")
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(_console_formatter)
@@ -2176,6 +3088,8 @@ def start_aria2_process(proxy_url: Optional[str]) -> subprocess.Popen:
     else:
         exe_path = "./aria2c"
 
+    ensure_aria2_conf()
+
     cmd = [exe_path, "--conf-path=aria2.conf", f"--stop-with-process={os.getpid()}"]
 
     if proxy_url:
@@ -2216,8 +3130,8 @@ def start_aria2_process(proxy_url: Optional[str]) -> subprocess.Popen:
     return process
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     userid = args.userid
     service = args.service
@@ -2236,6 +3150,33 @@ def main():
     postBegins = max(1, int(args.post_begins))
     cfg.postCounts = max(0, int(args.post_counts))
 
+    # 过滤配置
+    cfg.extBlacklist = args.ext_blacklist
+    cfg.extWhitelist = args.ext_whitelist
+    cfg.dateFrom = args.date_from
+    cfg.dateTo = args.date_to
+    cfg.existingFileMode = args.existing_file
+    cfg.pipelineEnabled = args.pipeline
+
+    if cfg.dateFrom is not None and cfg.dateTo is not None and cfg.dateFrom > cfg.dateTo:
+        logger.error(i18n(
+            f"起始日期 {cfg.dateFrom} 晚于截止日期 {cfg.dateTo}，请检查参数。",
+            f"Start date {cfg.dateFrom} is later than end date {cfg.dateTo}; please check the arguments.",
+        ))
+        sys.exit(2)
+
+    try:
+        cfg.nameBlacklistMatcher = compile_text_matcher(args.name_blacklist, args.name_regex)
+        cfg.nameWhitelistMatcher = compile_text_matcher(args.name_whitelist, args.name_regex)
+        cfg.titleBlacklistMatcher = compile_text_matcher(args.title_blacklist, args.title_regex)
+        cfg.titleWhitelistMatcher = compile_text_matcher(args.title_whitelist, args.title_regex)
+    except re.error as e:
+        logger.error(i18n(
+            f"正则表达式无效: {e}",
+            f"Invalid regular expression: {e}",
+        ))
+        sys.exit(2)
+
     # 仅根据 proxy_url 判断是否使用代理
     if args.proxy_url:
         currentProxyUrlStr: Optional[str] = args.proxy_url
@@ -2248,6 +3189,7 @@ def main():
         cfg.proxies = None
 
     # 配置 Aria2 RPC 地址 & 启动 aria2c（如需要）
+    init_file_logger(cfg.folder)
     if args.aria2_rpc_url:
         cfg.aria2_rpc_url = args.aria2_rpc_url
     elif is_attachment_numbering_rename_mode(cfg):
@@ -2256,8 +3198,6 @@ def main():
         cfg.aria2_rpc_url = LOCAL_ARIA2_RPC_URL
         aria2_process = start_aria2_process(currentProxyUrlStr)
         register_aria2_cleanup(aria2_process, cfg.aria2_rpc_url)
-
-    init_file_logger(cfg.folder)
 
     logger.info(i18n("\n---- 配置来咯 ----", "\n---- Configuration ----"))
     logger.info(i18n(f"用户 ID: {userid}", f"User ID: {userid}"))
@@ -2285,17 +3225,49 @@ def main():
     logger.info(i18n(f"目标文件夹: {cfg.folder}", f"Folder: {cfg.folder}"))
     logger.info(i18n(f"起始帖子序号: {postBegins}", f"Post begins: {postBegins}"))
     logger.info(i18n(f"帖子数量: {cfg.postCounts}", f"Post count: {cfg.postCounts}"))
+    logger.info(i18n(
+        f"已存在文件处理: {cfg.existingFileMode}",
+        f"Existing file mode: {cfg.existingFileMode}",
+    ))
+    logger.info(i18n(
+        f"流水线模式: {cfg.pipelineEnabled}",
+        f"Pipeline mode: {cfg.pipelineEnabled}",
+    ))
+    if cfg.extBlacklist or cfg.extWhitelist:
+        logger.info(i18n(
+            f"扩展名过滤: 黑名单={cfg.extBlacklist} 白名单={cfg.extWhitelist}",
+            f"Extension filter: blacklist={cfg.extBlacklist} whitelist={cfg.extWhitelist}",
+        ))
+    if cfg.dateFrom or cfg.dateTo:
+        logger.info(i18n(
+            f"日期过滤: {cfg.dateFrom or '-'} ~ {cfg.dateTo or '-'}",
+            f"Date filter: {cfg.dateFrom or '-'} ~ {cfg.dateTo or '-'}",
+        ))
+    if args.name_blacklist or args.name_whitelist:
+        logger.info(i18n(
+            f"文件名过滤 (正则={args.name_regex}): 黑名单={args.name_blacklist} 白名单={args.name_whitelist}",
+            f"Filename filter (regex={args.name_regex}): blacklist={args.name_blacklist} whitelist={args.name_whitelist}",
+        ))
+    if args.title_blacklist or args.title_whitelist:
+        logger.info(i18n(
+            f"标题过滤 (正则={args.title_regex}): 黑名单={args.title_blacklist} 白名单={args.title_whitelist}",
+            f"Title filter (regex={args.title_regex}): blacklist={args.title_blacklist} whitelist={args.title_whitelist}",
+        ))
     logger.info("-------------------\n")
 
     logger.info(i18n("\n---- 抓取开始咯 ----", "\n---- Fetch started ----"))
 
     cfg.baseUrl = cfg.baseUrl + "api/v1/"
 
+    global _active_config
+    _active_config = cfg
     try:
         getPostFromPage(userid, service, postBegins, cfg)
     finally:
         retry_empty_content_posts(cfg, i18n("结束时", "at end"))
+        drain_pending_tasks(cfg)
         stop_aria2_process()
+        _active_config = None
 
 
 if __name__ == "__main__":

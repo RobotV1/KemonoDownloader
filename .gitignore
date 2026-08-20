@@ -2,8 +2,10 @@ old/x64/*
 old/.vs/*
 .idea/*
 aria2c.exe
+aria2c.conf
+ui_config.json
 dist/*
 build/*
-*.spec
+#*.spec
 KemonoDownloadertest/*
 /__pycache__
