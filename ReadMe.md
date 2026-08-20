@@ -8,6 +8,8 @@ Since Kemono has stopped providing download services, the default download sourc
 
 [**Pawchive**](https://pawchive.pw/) is a mirror of Kemono.cr. It preserves all thumbnails and text resources after Kemono stopped its download service.
 
+Features such as file filtering were added to the original repository, along with a simple graphical user interface. **The main changes were made by AI**.
+
 ## Features
 
 - Batch-download all posts and attachments from a specified creator.

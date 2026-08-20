@@ -6,29 +6,20 @@
 
 [**Pawchive**](https://pawchive.pw/) 是 Kemono.cr 的一个镜像，保存了 Kemono 停止下载服务后的所有缩略图以及文本资源
 
+在原仓库的基础上添加了过滤等功能，并添加了简单的图形界面。**主要改动由AI完成**。
 
 
 ## 功能特性
 
 - 批量下载指定创作者的所有帖子及附件
-
 - 使用 Aria2 而不是 curl / request 进行高效下载，可通过 AriaNg 可视化查看进度
-
 - 可选使用远程 Aria2 服务器进行下载
-
 - 自动重试机制，应对 网络 / Kemono / 代理 不稳定情况
-
 - 支持 HTTP/HTTPS 代理
-
 - 自动创建按帖子组织的文件夹结构
-
 - 相比旧版本，支持下载预览图、各类附件文件和嵌入链接
-
 - 完整保存帖子内容为 HTML 文件
-
 - 跨平台支持（Windows / Linux）
-
-  
 
 ## 依赖
 
@@ -40,11 +31,7 @@
 
 - [Aria2](https://github.com/aria2/aria2/releases/tag/release-1.37.0)（指定下载服务器或使用本地 aria2c 可执行文件）
 
-  
-
 ## 使用方法
-
-
 
 ### 获取程序
 
@@ -68,19 +55,15 @@
 
 安装依赖：
 
-```
+```bash
 pip install -r requirements.txt
 ```
-
-
 
 ### 下载服务器配置
 
 如果你拥有自己的 Aria2 下载服务器，或者本地已经运行了Aria2服务器，可以通过下面的命令行参数配置 Aria2 下载服务
 
 如果你不知道什么是 Aria2 ，或者不想将在已有服务器中添加下载记录，可以不配置服务器，使用程序拉起的 Aria2 下载服务器进行下载。程序拉起的服务器使用6888端口，不会和本地已有服务器（如果有）冲突。
-
-
 
 ### 基本用法
 
@@ -91,7 +74,9 @@ pip install -r requirements.txt
 ```bash
 python main.py <用户ID> <服务名称>
 ```
+
 或
+
 ```cmd
 KemonoDownloader.exe <用户ID> <服务名称>
 ```
@@ -105,21 +90,20 @@ https://pawchive.pw/fanbox/user/12345678
 ```
 
 那么使用命令为：
+
 ```bash
 python main.py 12345678 fanbox
 ```
+
 或
+
 ```cmd
 KemonoDownloader.exe 12345678 fanbox
 ```
 
-
-
 ### 关于 Pawchive 未抓取到附件的帖子
 
 如果帖子的某个附件未被 Pawchive 收录（API 中标记为 `deferred=true`），程序会记录一条错误日志并跳过该附件；帖子的文字内容（HTML）与其他附件不受影响，仍会正常下载。
-
-
 
 ### 命令行参数
 
@@ -191,8 +175,6 @@ Pawchive 的服务器逻辑与Kemono存在一定的区别，如果 Kemono 重新
 ```bash
 python main.py 12345678 fanbox --proxy_url http://127.0.0.1:7897
 ```
-
-
 
 ### 指定下载范围
 
@@ -273,8 +255,6 @@ exe 用户直接双击 `KemonoDownloader.exe` 即可打开图形界面；源码�
 
 配置文件 `ui_config.json` 位于程序目录，保存下载目录、编号模式及高级设置的值，启动时自动载入。程序启动时若 `ui_config.json` 或 `aria2.conf` 缺失，会按默认配置自动生成；`aria2.session` 缺失时会自动创建空文件。
 
-
-
 ## 输出结构
 
 下载的内容会按以下结构组织：
@@ -289,14 +269,10 @@ exe 用户直接双击 `KemonoDownloader.exe` 即可打开图形界面；源码�
     └── ... 
 ```
 
-
-
 ## 日志
 
 - 控制台实时输出 INFO 级别日志
 - 下载目录下生成 `kemono_downloader.log` 文件，记录 DEBUG 级别详细日志
-
-
 
 ## Aria2 配置
 
@@ -305,8 +281,6 @@ exe 用户直接双击 `KemonoDownloader.exe` 即可打开图形界面；源码�
 1. `aria2c` / `aria2c.exe` 可执行文件存在于程序目录
 2. `aria2.conf` 配置文件缺失时会按默认配置自动生成；`aria2.session` 会话文件缺失时会自动创建空文件
 3. 可打开 [AriaNg 官方 demo](<https://ariang.mayswind.net/latest/#!/settings/rpc/set?protocol=http&host=localhost&port=6888&interface=jsonrpc>) 查看下载进度；该链接会将 RPC 设置为本地 aria2 地址 `http://localhost:6888/jsonrpc`，不再需要本地 `AriaNg.html`
-
-
 
 ## 自行构建 exe
 
@@ -317,8 +291,6 @@ build_exe.bat
 ```
 
 构建脚本会自动创建隔离的构建环境（`.venv-build`，仅安装 `requests` 和 `pyinstaller`）、处理虚拟环境下 Tcl/Tk 路径问题，并调用 PyInstaller 生成单文件 exe（内嵌图标，约 12 MB），产物位于 `dist\KemonoDownloader.exe`。分发时将 exe 与 `aria2c.exe` 放同一目录即可。
-
-
 
 ## 许可证
 
