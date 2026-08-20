@@ -422,35 +422,56 @@ quiet=true
 
 
 def ensure_aria2_conf(conf_path: str = ARIA2_CONF_PATH) -> None:
-    """aria2.conf / aria2.session 缺失时按默认配置自动生成。"""
-    if not os.path.exists(conf_path):
-        try:
-            with open(conf_path, "w", encoding="utf-8") as f:
-                f.write(DEFAULT_ARIA2_CONF)
-            logger.info(i18n(
-                f"未找到 {conf_path}，已按默认配置生成。",
-                f"{conf_path} not found; generated with default settings.",
-            ))
-        except OSError as e:
-            logger.warning(i18n(
-                f"生成默认 {conf_path} 失败: {e}",
-                f"Failed to generate default {conf_path}: {e}",
-            ))
+    """aria2.conf 缺失时按默认配置自动生成。"""
+    if os.path.exists(conf_path):
+        return
+    try:
+        with open(conf_path, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_ARIA2_CONF)
+        logger.info(i18n(
+            f"未找到 {conf_path}，已按默认配置生成。",
+            f"{conf_path} not found; generated with default settings.",
+        ))
+    except OSError as e:
+        logger.warning(i18n(
+            f"生成默认 {conf_path} 失败: {e}",
+            f"Failed to generate default {conf_path}: {e}",
+        ))
 
-    session_path = os.path.join(os.path.dirname(os.path.abspath(conf_path)) or ".", "aria2.session")
-    if not os.path.exists(session_path):
-        try:
-            with open(session_path, "w", encoding="utf-8"):
-                pass
-            logger.info(i18n(
-                "未找到 aria2.session，已自动生成空文件。",
-                "aria2.session not found; generated an empty file.",
-            ))
-        except OSError as e:
-            logger.warning(i18n(
-                f"生成默认 aria2.session 失败: {e}",
-                f"Failed to generate default aria2.session: {e}",
-            ))
+
+def get_aria2_session_path(conf_path: str = ARIA2_CONF_PATH) -> str:
+    """从 aria2.conf 读取 input-file 指定的会话文件路径（默认 aria2.session）。"""
+    try:
+        with open(conf_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() == "input-file" and value.strip():
+                    return value.strip()
+    except OSError:
+        pass
+    return "aria2.session"
+
+
+def ensure_aria2_session(conf_path: str = ARIA2_CONF_PATH) -> None:
+    """aria2 会话文件缺失时创建空文件，否则 aria2c 无法正常启动下载。"""
+    session_path = get_aria2_session_path(conf_path)
+    if os.path.exists(session_path):
+        return
+    try:
+        with open(session_path, "w", encoding="utf-8"):
+            pass
+        logger.info(i18n(
+            f"未找到 {session_path}，已创建空文件。",
+            f"{session_path} not found; created an empty file.",
+        ))
+    except OSError as e:
+        logger.warning(i18n(
+            f"创建空 {session_path} 失败: {e}",
+            f"Failed to create empty {session_path}: {e}",
+        ))
 
 
 def build_ariang_rpc_setup_url(aria2_rpc_url: str) -> str:
@@ -3089,6 +3110,7 @@ def start_aria2_process(proxy_url: Optional[str]) -> subprocess.Popen:
         exe_path = "./aria2c"
 
     ensure_aria2_conf()
+    ensure_aria2_session()
 
     cmd = [exe_path, "--conf-path=aria2.conf", f"--stop-with-process={os.getpid()}"]
 
@@ -3189,7 +3211,6 @@ def main(argv=None):
         cfg.proxies = None
 
     # 配置 Aria2 RPC 地址 & 启动 aria2c（如需要）
-    init_file_logger(cfg.folder)
     if args.aria2_rpc_url:
         cfg.aria2_rpc_url = args.aria2_rpc_url
     elif is_attachment_numbering_rename_mode(cfg):
@@ -3198,6 +3219,8 @@ def main(argv=None):
         cfg.aria2_rpc_url = LOCAL_ARIA2_RPC_URL
         aria2_process = start_aria2_process(currentProxyUrlStr)
         register_aria2_cleanup(aria2_process, cfg.aria2_rpc_url)
+
+    init_file_logger(cfg.folder)
 
     logger.info(i18n("\n---- 配置来咯 ----", "\n---- Configuration ----"))
     logger.info(i18n(f"用户 ID: {userid}", f"User ID: {userid}"))

@@ -4,8 +4,12 @@ old/.vs/*
 aria2c.exe
 aria2c.conf
 ui_config.json
-dist/*
-build/*
 #*.spec
-KemonoDownloadertest/*
+*.log
+/dist
+/build
+/.opencode
+/.venv-build
+/test_out
+/_backup
 /__pycache__

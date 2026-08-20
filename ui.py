@@ -28,14 +28,6 @@ BASE_DIR = os.path.dirname(
 )
 UI_CONFIG_PATH = os.path.join(BASE_DIR, "ui_config.json")
 
-
-def _resource_path(name: str) -> str:
-    """打包（--onefile）时资源位于 sys._MEIPASS，源码模式位于程序目录。"""
-    if getattr(sys, "frozen", False):
-        bundle = getattr(sys, "_MEIPASS", BASE_DIR)
-        return os.path.join(bundle, name)
-    return os.path.join(BASE_DIR, name)
-
 # 编号模式: (内部值, 中文显示, 英文显示)
 NUMBERING_MODES = [
     (kd.NUMBER_ATTACHMENTS_OFF, "关闭", "off"),
@@ -383,7 +375,6 @@ class DownloaderUI:
         self.root = root
         self.root.title(i18n("Kemono 下载器", "Kemono Downloader"))
         self.root.geometry("1150x640")
-        self._set_window_icon()
 
         self.config = load_ui_config()
         kd.ensure_aria2_conf()
@@ -400,16 +391,6 @@ class DownloaderUI:
 
         self.root.after(200, self._poll_log_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _set_window_icon(self):
-        try:
-            if os.name != "nt":
-                return
-            icon_path = _resource_path("pawchive_favicon.ico")
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(icon_path)
-        except Exception:
-            pass
 
     # ---------- 变量 ----------
     def _build_variables(self):
@@ -824,6 +805,13 @@ class DownloaderUI:
     def _current_rpc_url(self) -> str:
         return self.aria2_rpc_url_var.get().strip() or kd.LOCAL_ARIA2_RPC_URL
 
+    def _clear_task_tree(self):
+        """清空任务列表与全局统计（停止后/无任务时调用）。"""
+        for item in list(self.tree_items.values()):
+            self.task_tree.delete(item)
+        self.tree_items.clear()
+        self.global_stat_var.set("")
+
     def _poll_aria2_status(self):
         try:
             if not self.root.winfo_exists():
@@ -847,6 +835,10 @@ class DownloaderUI:
                 "aria2.getGlobalStat", [], aria2_rpc_url=rpc_url, timeout=2,
             ).get("result", {})
         except Exception:
+            if self.run_state == "idle":
+                # RPC 不可用（如停止后 aria2c 已被 worker 关闭）且当前无运行
+                # 任务：清空残留显示，避免停留在停止前的状态
+                self._clear_task_tree()
             return
 
         status_text = {
@@ -943,6 +935,9 @@ class DownloaderUI:
                 cfg.session.close()  # 中断在途 HTTP 请求
             except Exception:
                 pass
+        # 停止后 worker 会中止全部在途任务并关闭本地 aria2c，
+        # 直接清空任务列表，避免残留显示停止前的状态
+        self._clear_task_tree()
         self._on_state_changed("idle")
         # worker 将在检查点退出，_on_worker_done 完成复位
 
@@ -1069,9 +1064,7 @@ class DownloaderUI:
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
-        for item in list(self.tree_items.values()):
-            self.task_tree.delete(item)
-        self.tree_items.clear()
+        self._clear_task_tree()
 
         self.run_state = "running"
         self.start_button.config(text=i18n("暂停下载", "Pause download"))
@@ -1137,6 +1130,13 @@ def main():
     # 保证 aria2c / aria2.conf / ui_config.json 等相对路径始终解析到程序目录
     os.chdir(BASE_DIR)
     root = tk.Tk()
+    # 主窗口图标：打包后图标文件位于 PyInstaller 临时解压目录 (_MEIPASS)
+    icon_path = os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "pawchive_favicon.ico")
+    if os.path.exists(icon_path):
+        try:
+            root.iconbitmap(default=icon_path)
+        except tk.TclError:
+            pass
     DownloaderUI(root)
     root.mainloop()
 

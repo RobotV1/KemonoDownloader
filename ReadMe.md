@@ -8,7 +8,7 @@ Since Kemono has stopped providing download services, the default download sourc
 
 [**Pawchive**](https://pawchive.pw/) is a mirror of Kemono.cr. It preserves all thumbnails and text resources after Kemono stopped its download service.
 
-## Featuresf
+## Features
 
 - Batch-download all posts and attachments from a specified creator.
 - Uses Aria2 instead of curl / requests for efficient downloads, with progress viewable through the AriaNg web UI.
@@ -22,31 +22,35 @@ Since Kemono has stopped providing download services, the default download sourc
 
 ## Dependencies
 
+The dependencies below apply to **running from source** (exe users need neither Python nor requests, only `aria2c.exe`):
+
 - Python 3.10+
 - [requests](https://pypi.org/project/requests/)
 - [Aria2](https://github.com/aria2/aria2/releases/tag/release-1.37.0) (use either a specified download server or a local `aria2c` executable)
 
 ## Usage
 
-### Download the Tool and Configuration Files
+### Getting the Program
 
-Download the latest Release, or download the following three files:
+**Option 1 (recommended): download the exe from Releases (Windows only)**
 
-> aria2.conf
->
-> aria2.session
->
+1. Download `KemonoDownloader.exe` from this repository's Releases page.
+2. Download the appropriate build for your system from the [Aria2 release page](https://github.com/aria2/aria2/releases/tag/release-1.37.0), and place its `aria2c.exe` in the same directory as `KemonoDownloader.exe`.
+3. `aria2.conf`, `aria2.session`, and `ui_config.json` are generated automatically on first run; no manual setup is needed.
+
+**Option 2: run from source (Windows / Linux)**
+
+Download or clone the following files from this repository:
+
 > main.py
+>
+> ui.py
+>
+> requirements.txt
 
-Then download the appropriate version for your system from the [Aria2 release page](https://github.com/aria2/aria2/releases/tag/release-1.37.0), and place it in the same directory as the three files above.
+Then download the appropriate build for your system from the [Aria2 release page](https://github.com/aria2/aria2/releases/tag/release-1.37.0) (`aria2c` / `aria2c.exe`), and place it in the same directory as the files above.
 
 Install dependencies:
-
-```bash
-pip install requests
-```
-
-Alternatively, download `requirements.txt` and run:
 
 ```bash
 pip install -r requirements.txt
@@ -61,6 +65,8 @@ If you do not know what Aria2 is, or if you do not want to add download records 
 ### Basic Usage
 
 This program supports command-line usage and also provides a graphical interface (see the "Graphical Interface" section below).
+
+With the exe: **double-clicking or running `KemonoDownloader.exe` without any arguments opens the graphical interface; running it with any argument switches to command-line mode**, whose arguments are identical to those of `main.py`.
 
 ```bash
 python main.py <user ID> <service name>
@@ -94,7 +100,7 @@ KemonoDownloader.exe 12345678 fanbox
 
 ### Posts Whose Attachments Were Not Crawled by Pawchive
 
-If the attachments of a crawled post have not been archived by Pawchive, the program will only
+If an attachment of a post has not been archived by Pawchive (marked `deferred=true` in the API), the program logs an error and skips that attachment; the post's text content (HTML) and its other attachments are still downloaded normally.
 
 ### Command-Line Arguments
 
@@ -232,7 +238,7 @@ python main.py 12345678 fanbox --number_attachments image_rename
 
 ## Graphical Interface
 
-Run `python ui.py` to launch the graphical interface (Tkinter, no extra dependencies). The UI covers every feature of the command-line mode:
+Exe users can simply double-click `KemonoDownloader.exe` to open the graphical interface; source users run `python ui.py` (Tkinter, no extra dependencies). The UI covers every feature of the command-line mode:
 
 - **Download target**: paste a full creator URL (e.g. `https://pawchive.pw/fanbox/user/12345678`, or a post link with a `/post/xxx` suffix) to auto-detect the service and user ID; the URL host is validated against the base URL in "Advanced settings". You can also fill in the two fields manually (only a non-empty check, for compatibility with other similar sites).
 - **Basic settings**: download folder, post range, date filters, attachment numbering mode (the UI defaults to "image"; choosing "rename"/"image_rename" shows a warning because those modes do not download files).
@@ -244,25 +250,7 @@ Run `python ui.py` to launch the graphical interface (Tkinter, no extra dependen
 - **Stop**: the "Stop download" button (left of "Start download") immediately aborts fetching and download tasks; downloaded files are kept, and in-flight aria2 tasks are cleaned up so they are not auto-resumed uncontrollably on the next launch.
 - **Log**: live log output inside the window.
 
-The configuration file `ui_config.json` lives next to the program and stores the download folder, numbering mode, and advanced settings; it is loaded automatically on startup. If `ui_config.json` or `aria2.conf` is missing at startup, it is generated automatically with default values.
-
-## Packaging as a Single-File Exe
-
-The program can be packaged into a single `KemonoDownloader.exe` (main program only, **aria2c not included**):
-
-1. Install the build dependency: `pip install pyinstaller`
-2. Run `build.bat` in the project directory (or run the PyInstaller command inside it manually)
-3. The artifact is at `dist\KemonoDownloader.exe`
-
-The exe supports both invocation styles:
-
-- **Double-click**: opens the graphical interface (no console window).
-- **Command line**: behaves exactly like `python main.py`; when run from cmd / PowerShell / Windows Terminal it attaches to the parent console and shows logs:
-  ```cmd
-  KemonoDownloader.exe <user ID> <service name> [arguments...]
-  ```
-
-For deployment, place `aria2c.exe` next to the exe. `aria2.conf`, `aria2.session`, and `ui_config.json` are auto-generated next to the exe when missing. If an unhandled error occurs, details are written to `KemonoDownloader.error.log` next to the exe.
+The configuration file `ui_config.json` lives next to the program and stores the download folder, numbering mode, and advanced settings; it is loaded automatically on startup. If `ui_config.json` or `aria2.conf` is missing at startup, it is generated automatically with default values; a missing `aria2.session` is recreated as an empty file.
 
 ## Output Structure
 
@@ -272,7 +260,7 @@ Downloaded content is organized as follows:
 <download directory>/
 └── <service name>_<username>/
     ├── <publish date>_<post title>_<post ID>/
-    │   ├── ! Content.html       # Post content
+    │   ├── !Content.html        # Post content
     │   ├── attachment files...
     │   └── em0_xxx.url          # Embedded link
     └── ...
@@ -288,8 +276,18 @@ Downloaded content is organized as follows:
 If `--aria2-rpc-url` is not specified, the program automatically starts `aria2c` from the same directory. Make sure that:
 
 1. The `aria2c` / `aria2c.exe` executable exists in the program directory.
-2. The `aria2.conf` configuration file exists in the program directory.
+2. The `aria2.conf` configuration file is generated with default settings if missing; a missing `aria2.session` file is recreated as an empty file.
 3. Open the [official AriaNg demo](<https://ariang.mayswind.net/latest/#!/settings/rpc/set?protocol=http&host=localhost&port=6888&interface=jsonrpc>) to view download progress. The link sets RPC to the local aria2 URL `http://localhost:6888/jsonrpc`, so a local `AriaNg.html` is no longer needed.
+
+## Building the exe Yourself
+
+If you want to build the exe yourself instead of downloading it from Releases, run this in the project directory:
+
+```cmd
+build_exe.bat
+```
+
+The build script automatically creates an isolated build environment (`.venv-build`, installing only `requests` and `pyinstaller`), works around Tcl/Tk path detection inside the virtual environment, and invokes PyInstaller to produce a single-file exe (with embedded icon, about 12 MB) at `dist\KemonoDownloader.exe`. To distribute, place the exe in the same directory as `aria2c.exe`.
 
 ## License
 

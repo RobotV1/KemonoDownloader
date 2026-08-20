@@ -32,6 +32,8 @@
 
 ## 依赖
 
+以下为**源码运行**的依赖（exe 用户无需安装 Python 和 requests，仅需 aria2c.exe）：
+
 - Python 3.10+
 
 - [requests](https://pypi.org/project/requests/)
@@ -44,25 +46,28 @@
 
 
 
-### 下载工具和配置文件
+### 获取程序
 
-下载最新的 Release 或者下载
+**方式一（推荐）：从 Release 下载 exe（仅 Windows）**
 
-> aria2.conf
->
-> aria2.session
->
+1. 从本仓库的 Release 页面下载 `KemonoDownloader.exe`；
+2. 从 [Aria2 release](https://github.com/aria2/aria2/releases/tag/release-1.37.0) 页面下载适合您系统的版本，将其中的 `aria2c.exe` 放在与 `KemonoDownloader.exe` 相同的目录下；
+3. 首次运行时会自动生成 `aria2.conf`、`aria2.session`、`ui_config.json`，无需手动准备。
+
+**方式二：源码运行（Windows / Linux）**
+
+下载或克隆本仓库的以下文件：
+
 > main.py
+>
+> ui.py
+>
+> requirements.txt
 
-三个文件，并从 [Aria2 release](https://github.com/aria2/aria2/releases/tag/release-1.37.0)  页面下载合适您系统的版本，放在和以上三个文件相同的目录下
+并从 [Aria2 release](https://github.com/aria2/aria2/releases/tag/release-1.37.0) 页面下载合适您系统的版本（`aria2c` / `aria2c.exe`），放在和以上文件相同的目录下。
 
 安装依赖：
 
-```
-pip install requests
-```
-
-或者下载 requirements.txt 并执行
 ```
 pip install -r requirements.txt
 ```
@@ -79,7 +84,9 @@ pip install -r requirements.txt
 
 ### 基本用法
 
-本程序支持命令行调用，也提供图形界面（见下文"图形界面"章节）
+本程序支持命令行调用，也提供图形界面（见下文"图形界面"章节）。
+
+使用 exe 时：**双击或无参数运行 `KemonoDownloader.exe` 会打开图形界面；携带任何参数运行即为命令行模式**，参数与 `main.py` 完全一致。
 
 ```bash
 python main.py <用户ID> <服务名称>
@@ -110,7 +117,7 @@ KemonoDownloader.exe 12345678 fanbox
 
 ### 关于 Pawchive 未抓取到附件的帖子
 
-如果抓取的帖子的附件未被Pawchive收录，程序将只会
+如果帖子的某个附件未被 Pawchive 收录（API 中标记为 `deferred=true`），程序会记录一条错误日志并跳过该附件；帖子的文字内容（HTML）与其他附件不受影响，仍会正常下载。
 
 
 
@@ -124,7 +131,7 @@ KemonoDownloader.exe 12345678 fanbox
 | `--file_server`         | Pawchive 下载服务器URL                                       | `https://file.pawchive.pw/`     |
 | `--proxy_url`           | HTTP/HTTPS 代理地址                                          | `None`                          |
 | `--max_retries`         | 页面请求最大重试次数                                         | `5`                             |
-| `--base_backoff_factor` | 页面请求重试延迟基准因子（秒）                               | `3. 0`                          |
+| `--base_backoff_factor` | 页面请求重试延迟基准因子（秒）                               | `3.0`                           |
 | `--folder`              | 下载目标文件夹                                               | 当前工作目录                    |
 | `--post_begins`         | 从第 N 个帖子开始下载                                        | `1`                             |
 | `--post_counts`         | 下载帖子数量（0 表示全部）                                   | `0`                             |
@@ -252,7 +259,7 @@ python main.py 12345678 fanbox --number_attachments 图片模式重命名
 
 ## 图形界面
 
-运行 `python ui.py` 启动图形界面（Tkinter，无需额外依赖）。界面完整支持命令行模式的所有功能：
+exe 用户直接双击 `KemonoDownloader.exe` 即可打开图形界面；源码用户运行 `python ui.py` 启动（Tkinter，无需额外依赖）。界面完整支持命令行模式的所有功能：
 
 - **下载目标**：直接粘贴创作者完整 URL（如 `https://pawchive.pw/fanbox/user/12345678` 或带 `/post/xxx` 后缀的帖子链接）即可自动识别服务名和用户 ID；识别时会校验 URL 主机名与"高级设置"中的基础 URL 是否一致。也可以手动填写两个字段（仅做非空校验，以兼容其他类似站点）。
 - **基本设置**：下载目录、帖子范围、日期过滤、附件编号模式（界面默认"图片"模式；选择"重命名/图片模式重命名"时会显示警告，因为该模式不下载文件）。
@@ -264,27 +271,9 @@ python main.py 12345678 fanbox --number_attachments 图片模式重命名
 - **停止下载**："停止下载"按钮（位于"开始下载"左侧）立即终止抓取与下载任务，已下载的文件保留；在途 aria2 任务会被清理，不会在下次启动时失控自动续下。
 - **日志**：界面内实时显示运行日志。
 
-配置文件 `ui_config.json` 位于程序目录，保存下载目录、编号模式及高级设置的值，启动时自动载入。程序启动时若 `ui_config.json` 或 `aria2.conf` 缺失，会按默认配置自动生成。
+配置文件 `ui_config.json` 位于程序目录，保存下载目录、编号模式及高级设置的值，启动时自动载入。程序启动时若 `ui_config.json` 或 `aria2.conf` 缺失，会按默认配置自动生成；`aria2.session` 缺失时会自动创建空文件。
 
 
-
-## 打包为单文件 exe
-
-程序可打包为单文件 `KemonoDownloader.exe`（仅主程序，**不包含 aria2c**）：
-
-1. 安装构建依赖：`pip install pyinstaller`
-2. 在项目目录运行 `build.bat`（或手动执行其中的 PyInstaller 命令）
-3. 产物位于 `dist\KemonoDownloader.exe`
-
-exe 同时支持两种调用方式：
-
-- **双击运行**：打开图形界面（无控制台窗口）。
-- **命令行调用**：行为与 `python main.py` 完全一致，在 cmd / PowerShell / Windows Terminal 中执行会挂接父控制台显示日志：
-  ```cmd
-  KemonoDownloader.exe <用户ID> <服务名称> [参数...]
-  ```
-
-部署时请将 `aria2c.exe` 放在 exe 同目录；`aria2.conf`、`aria2.session`、`ui_config.json` 缺失时会自动生成于 exe 同目录。若发生未处理的异常，错误详情会写入 exe 同目录的 `KemonoDownloader.error.log`。
 
 ## 输出结构
 
@@ -294,9 +283,9 @@ exe 同时支持两种调用方式：
 <下载目录>/
 └── <服务名>_<用户名>/
     ├── <发布日期>_<帖子标题>_<帖子ID>/
-    │   ├── ! Content.html       # 帖子内容
+    │   ├── !Content.html        # 帖子内容
     │   ├── 附件文件... 
-    │   └── em0_xxx. url         # 嵌入链接
+    │   └── em0_xxx.url          # 嵌入链接
     └── ... 
 ```
 
@@ -305,7 +294,7 @@ exe 同时支持两种调用方式：
 ## 日志
 
 - 控制台实时输出 INFO 级别日志
-- 下载目录下生成 `kemono_downloader. log` 文件，记录 DEBUG 级别详细日志
+- 下载目录下生成 `kemono_downloader.log` 文件，记录 DEBUG 级别详细日志
 
 
 
@@ -314,8 +303,20 @@ exe 同时支持两种调用方式：
 如果未指定 `--aria2-rpc-url`，程序会自动在同目录下启动 `aria2c`，需要确保：
 
 1. `aria2c` / `aria2c.exe` 可执行文件存在于程序目录
-2. `aria2.conf` 配置文件存在于程序目录
+2. `aria2.conf` 配置文件缺失时会按默认配置自动生成；`aria2.session` 会话文件缺失时会自动创建空文件
 3. 可打开 [AriaNg 官方 demo](<https://ariang.mayswind.net/latest/#!/settings/rpc/set?protocol=http&host=localhost&port=6888&interface=jsonrpc>) 查看下载进度；该链接会将 RPC 设置为本地 aria2 地址 `http://localhost:6888/jsonrpc`，不再需要本地 `AriaNg.html`
+
+
+
+## 自行构建 exe
+
+如需自行打包 exe（而非从 Release 下载），在项目目录运行：
+
+```cmd
+build_exe.bat
+```
+
+构建脚本会自动创建隔离的构建环境（`.venv-build`，仅安装 `requests` 和 `pyinstaller`）、处理虚拟环境下 Tcl/Tk 路径问题，并调用 PyInstaller 生成单文件 exe（内嵌图标，约 12 MB），产物位于 `dist\KemonoDownloader.exe`。分发时将 exe 与 `aria2c.exe` 放同一目录即可。
 
 
 

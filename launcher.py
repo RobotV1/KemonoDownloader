@@ -1,55 +1,83 @@
 # -*- coding: utf-8 -*-
 """
-KemonoDownloader 打包入口（PyInstaller --windowed 单 exe）。
+KemonoDownloader 统一入口（用于打包为单 exe）。
 
-- 无命令行参数：启动图形界面（UI），无控制台窗口。
-- 有命令行参数：CLI 模式，行为与 main.py 完全一致；
-  Windows 下尝试挂接父进程控制台以显示日志输出。
+- 无参数运行        -> 打开图形界面（ui.main），并隐藏控制台窗口；
+- 传入任何参数运行  -> 命令行模式，行为与原版 main.py 一致（main.main）。
 """
 
 import os
 import sys
 
 
-def _redirect_stdio():
-    """仅打包（--windowed）后需要处理：UI 模式静默，CLI 模式挂接父控制台。"""
-    if not getattr(sys, "frozen", False):
-        return  # 源码模式已有控制台，无需处理
-    devnull = open(os.devnull, "w", encoding="utf-8", errors="replace")
-    sys.stdout = devnull
-    sys.stderr = devnull
-    if os.name == "nt":
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            if kernel32.AttachConsole(-1):
-                console_out = open("CONOUT$", "w", encoding="utf-8", errors="replace")
-                sys.stdout = console_out
-                sys.stderr = console_out
-                sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+def hide_console_window() -> None:
+    """隐藏 Windows 控制台窗口（双击启动 UI 时避免残留黑框）。
 
-
-def main():
-    if getattr(sys, "frozen", False):
-        # 保证 aria2c.exe / aria2.conf / ui_config.json 相对解析到 exe 所在目录
-        os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
-
+    判定规则（满足其一才隐藏）：
+      1. 控制台由本进程独占（onedir 等单进程场景）；
+      2. 控制台窗口标题等于本 exe 完整路径——Windows 为双击启动的
+         控制台程序新建的控制台标题即程序完整路径，而从 cmd/PowerShell
+         等已有终端启动时标题是终端自己的，不会误隐藏用户的终端窗口。
+    """
+    if os.name != "nt":
+        return
     try:
-        if len(sys.argv) > 1:
-            # CLI 模式：行为与 main.py 相同
-            _redirect_stdio()
-            import main as kd
-            kd.main(sys.argv[1:])
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+
+        hwnd = kernel32.GetConsoleWindow()
+        if not hwnd:
             return
 
-        # UI 模式
-        _redirect_stdio()
+        process_ids = (ctypes.c_ulong * 16)()
+        if kernel32.GetConsoleProcessList(process_ids, 16) == 1:
+            user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            return
+
+        title_buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, title_buf, 512)
+        if title_buf.value and os.path.normcase(title_buf.value) == os.path.normcase(
+                os.path.abspath(sys.executable)):
+            user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
+
+def _fallback_i18n(zh: str, en: str) -> str:
+    """异常兜底路径使用的语言判断（不依赖 main 模块）。"""
+    override = os.environ.get("KEMONO_DOWNLOADER_LANG", "").strip().lower()
+    if override:
+        return zh if override.startswith("zh") else en
+    try:
+        import locale
+        lang = locale.getlocale()[0] or ""
+        return zh if lang.lower().startswith("zh") else en
+    except Exception:
+        return zh
+
+
+def _run() -> None:
+    if len(sys.argv) > 1:
+        # 命令行模式：完整转发参数，行为与 main.py 一致
+        import main as kd
+
+        kd.main()
+    else:
+        # 无参数：隐藏控制台并打开 UI
+        hide_console_window()
         import ui
+
         ui.main()
+
+
+def main() -> None:
+    try:
+        _run()
     except Exception:
         import traceback
+
         traceback.print_exc()
         if getattr(sys, "frozen", False):
             try:
@@ -63,6 +91,7 @@ def main():
                 pass
             try:
                 import ctypes
+
                 ctypes.windll.user32.MessageBoxW(
                     0,
                     _fallback_i18n(
@@ -75,19 +104,6 @@ def main():
             except Exception:
                 pass
         raise
-
-
-def _fallback_i18n(zh: str, en: str) -> str:
-    """异常兜底路径使用的语言判断（不依赖 main 模块）。"""
-    override = os.environ.get("KEMONO_DOWNLOADER_LANG", "").strip().lower()
-    if override:
-        return zh if override.startswith("zh") else en
-    try:
-        import locale
-        lang = locale.getdefaultlocale()[0] or ""
-        return zh if lang.lower().startswith("zh") else en
-    except Exception:
-        return zh
 
 
 if __name__ == "__main__":
